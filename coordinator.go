@@ -86,7 +86,11 @@ type coordinator struct {
 
 	overlap bool
 	nextID  atomic.Int64
-	active  *globalSnapshot
+
+	// Every in-flight collection owns an independent record keyed by its own
+	// snapshot id; reports and cancellations are routed by id so two
+	// overlapping collections can never mix their cuts.
+	active  map[int64]*globalSnapshot
 	history map[int64]*snapshotResult
 }
 
@@ -106,6 +110,7 @@ func newCoordinator(ctx context.Context, nodes []*node, links [][]*link, overlap
 		events:  NewMailbox[coordinatorEvent](ctx),
 		nodes:   nodes,
 		links:   links,
+		active:  make(map[int64]*globalSnapshot),
 		history: make(map[int64]*snapshotResult),
 	}
 	if len(overlapping) > 0 {
@@ -161,22 +166,26 @@ func (c *coordinator) run(ctx context.Context) {
 		case event.get != nil:
 			c.handleGet(event.get)
 		case event.report != nil:
-			c.handleReport(*event.report)
+			c.handleReport(ctx, *event.report)
 		}
 	}
 }
 
+func (c *coordinator) activeLimit() int {
+	if c.overlap {
+		return 2
+	}
+	return 1
+}
+
 func (c *coordinator) handleStart(ctx context.Context, req *coordinatorStart) {
-	if c.active != nil && !c.overlap {
+	if len(c.active) >= c.activeLimit() {
 		req.reply <- startResult{err: errSnapshotActive}
 		return
 	}
 
-	if c.active != nil {
-		c.history[c.active.id] = c.active.view()
-	}
 	id := c.nextID.Add(1)
-	c.active = &globalSnapshot{
+	c.active[id] = &globalSnapshot{
 		id:          id,
 		balances:    make(map[int]int),
 		channels:    make(map[channelKey]*channelSnapshot),
@@ -188,8 +197,7 @@ func (c *coordinator) handleStart(ctx context.Context, req *coordinatorStart) {
 	// markers before this synchronous call returns. Markers propagate through
 	// the normal channels to every other node.
 	if err := c.nodes[req.initiator].beginSnapshot(ctx, id); err != nil {
-		delete(c.history, id)
-		c.active = nil
+		delete(c.active, id)
 		req.reply <- startResult{err: err}
 		return
 	}
@@ -198,8 +206,8 @@ func (c *coordinator) handleStart(ctx context.Context, req *coordinatorStart) {
 }
 
 func (c *coordinator) handleGet(req *coordinatorGet) {
-	if c.active != nil && c.active.id == req.id {
-		req.reply <- getResult{result: c.active.view()}
+	if s, active := c.active[req.id]; active {
+		req.reply <- getResult{result: s.view()}
 		return
 	}
 	result, exists := c.history[req.id]
@@ -210,14 +218,14 @@ func (c *coordinator) handleGet(req *coordinatorGet) {
 	req.reply <- getResult{result: result}
 }
 
-func (c *coordinator) handleReport(report snapshotReport) {
-	if c.active == nil || c.active.id != report.snapshotID {
-		// Reports from a finished or unknown snapshot cannot contaminate a
-		// later collection.
+func (c *coordinator) handleReport(ctx context.Context, report snapshotReport) {
+	s, active := c.active[report.snapshotID]
+	if !active {
+		// Reports from a finished, completed, or cancelled collection cannot
+		// contaminate any other collection and never re-open a terminal one.
 		return
 	}
 
-	s := c.active
 	switch report.kind {
 	case reportLocal:
 		if s.localDone[report.nodeID] {
@@ -249,9 +257,19 @@ func (c *coordinator) handleReport(report snapshotReport) {
 	}
 
 	if len(s.localDone) == nodeCount && len(s.channelDone) == nodeCount*(nodeCount-1) {
-		result := s.view()
-		c.history[s.id] = result
-		c.active = nil
+		c.completeCollection(ctx, s)
+	}
+}
+
+// completeCollection freezes the full cut as its immutable terminal record and
+// releases the slot. Every node retires that id too, so markers still queued in
+// the channels cannot re-open the collection anywhere.
+func (c *coordinator) completeCollection(ctx context.Context, s *globalSnapshot) {
+	result := s.view()
+	c.history[s.id] = result
+	delete(c.active, s.id)
+	for _, n := range c.nodes {
+		n.retire(ctx, s.id)
 	}
 }
 
@@ -331,16 +349,25 @@ func (c *coordinator) cancel(ctx context.Context, id int64) (*snapshotResult, er
 		return nil, ctx.Err()
 	}
 }
+
+// handleCancel stops only the requested collection. Its last accepted partial
+// evidence is frozen as the cancelled terminal record and the slot is freed;
+// cancelling an id that already reached a terminal state returns that same
+// state unchanged.
 func (c *coordinator) handleCancel(ctx context.Context, req *coordinatorCancel) {
-	if c.active != nil && c.active.id == req.id {
-		result := c.active.view()
+	if s, active := c.active[req.id]; active {
+		result := s.view()
 		result.Cancelled = true
 		result.Complete = false
 		result.ConservationOK = false
 		c.history[req.id] = result
-		c.active = nil
-		for _, node := range c.nodes {
-			node.retire(ctx, req.id)
+		delete(c.active, req.id)
+
+		// Retire this id at every node before replying: queued/late markers
+		// for it must never re-open the local cut or interfere with the other
+		// collection or with transfers still in flight.
+		for _, n := range c.nodes {
+			n.retire(ctx, req.id)
 		}
 		req.reply <- getResult{result: result}
 		return

@@ -167,8 +167,17 @@ A controlled scenario for “debited but not received” is:
 - marker / transfer / marker interleaving and FIFO separation;
 - two consecutive snapshots with separate IDs and no record mixing;
 - rejection of a second concurrently active snapshot;
+- two overlapping collections (`SNAPSHOT_OVERLAP=1`) with independent per-id
+  local cuts, channel state, and completion, and rejection of a third while
+  both slots are taken;
+- cancellation that stops only that id, retains the last partial evidence as
+  the stable cancelled terminal state, frees its slot, and leaves completed
+  results untouched;
+- repeated cancellation, late markers, and duplicate markers never change a
+  terminal state, revive a cancelled collection, or disturb the other one;
 - conservation for every completed cut and traceability of in-flight transfers;
-- HTTP transfer, snapshot, duplicate-ID, and barrier behavior.
+- HTTP transfer, snapshot, cancellation, duplicate-ID, and barrier behavior,
+  including overlap and cancellation flows over a real TCP listener.
 
 
 ## 重叠采集与取消

@@ -234,6 +234,9 @@ func (n *node) handleCommand(cmd nodeCommand) {
 	switch {
 	case cmd.retire != nil:
 		delete(n.active, cmd.retire.id)
+		// A retired id is terminal at this node: its markers may still be
+		// queued in the FIFO channels, but none of them may re-open the cut.
+		n.retired[cmd.retire.id] = true
 		cmd.retire.reply <- nil
 	case cmd.transferCmd != nil:
 		n.handleTransferCommand(cmd.transferCmd)
@@ -257,6 +260,11 @@ func (n *node) handleTransferCommand(req *transferCmd) {
 }
 
 func (n *node) handleBegin(req *beginSnapshot) {
+	if n.retired[req.id] {
+		// Late marker for an already completed/cancelled collection.
+		req.reply <- nil
+		return
+	}
 	if _, exists := n.active[req.id]; exists {
 		req.reply <- nil
 		return
@@ -311,6 +319,13 @@ func (n *node) handleTransferIngress(t *transfer) {
 }
 
 func (n *node) handleMarkerIngress(m *marker) {
+	if n.retired[m.SnapshotID] {
+		// The collection already reached a terminal state (completed or
+		// cancelled). A queued, late, or duplicated marker must not regenerate
+		// any state for it and must not touch any other collection.
+		return
+	}
+
 	session, exists := n.active[m.SnapshotID]
 	if !exists {
 		// The first marker causes the local cut; handleBegin emits this node's
@@ -318,11 +333,16 @@ func (n *node) handleMarkerIngress(m *marker) {
 		begin := &beginSnapshot{id: m.SnapshotID, reply: make(chan error, 1)}
 		n.handleBegin(begin)
 		session = n.active[m.SnapshotID]
+		if session == nil {
+			// handleBegin refused a retired id; do not revive the collection.
+			return
+		}
 	}
 
 	state, ok := session.channels[m.From]
-	if !ok {
-		// A duplicate/stale marker must not replace an already reported cut.
+	if !ok || state.closed {
+		// A duplicate/stale marker must not replace an already reported cut or
+		// corrupt the remaining-channel count.
 		return
 	}
 	n.report(snapshotReport{

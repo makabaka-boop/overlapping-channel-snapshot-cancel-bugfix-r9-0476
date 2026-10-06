@@ -1,0 +1,11 @@
+services:
+  snapshot-lab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chandy-lamport-lab:local
+    ports:
+      - "8080:8080"
+    environment:
+      SNAPSHOT_LAB_ADDR: ":8080"
+    restart: unless-stopped

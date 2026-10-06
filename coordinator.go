@@ -86,7 +86,7 @@ type coordinator struct {
 
 	overlap bool
 	nextID  atomic.Int64
-	active  *globalSnapshot
+	active  map[int64]*globalSnapshot
 	history map[int64]*snapshotResult
 }
 
@@ -106,6 +106,7 @@ func newCoordinator(ctx context.Context, nodes []*node, links [][]*link, overlap
 		events:  NewMailbox[coordinatorEvent](ctx),
 		nodes:   nodes,
 		links:   links,
+		active:  make(map[int64]*globalSnapshot),
 		history: make(map[int64]*snapshotResult),
 	}
 	if len(overlapping) > 0 {
@@ -113,6 +114,15 @@ func newCoordinator(ctx context.Context, nodes []*node, links [][]*link, overlap
 	}
 	go c.run(ctx)
 	return c
+}
+
+// maxActive bounds concurrently collecting snapshots: two with overlap
+// enabled, otherwise the classic single snapshot at a time.
+func (c *coordinator) maxActive() int {
+	if c.overlap {
+		return 2
+	}
+	return 1
 }
 
 func (c *coordinator) report(report snapshotReport) {
@@ -167,16 +177,13 @@ func (c *coordinator) run(ctx context.Context) {
 }
 
 func (c *coordinator) handleStart(ctx context.Context, req *coordinatorStart) {
-	if c.active != nil && !c.overlap {
+	if len(c.active) >= c.maxActive() {
 		req.reply <- startResult{err: errSnapshotActive}
 		return
 	}
 
-	if c.active != nil {
-		c.history[c.active.id] = c.active.view()
-	}
 	id := c.nextID.Add(1)
-	c.active = &globalSnapshot{
+	c.active[id] = &globalSnapshot{
 		id:          id,
 		balances:    make(map[int]int),
 		channels:    make(map[channelKey]*channelSnapshot),
@@ -188,8 +195,7 @@ func (c *coordinator) handleStart(ctx context.Context, req *coordinatorStart) {
 	// markers before this synchronous call returns. Markers propagate through
 	// the normal channels to every other node.
 	if err := c.nodes[req.initiator].beginSnapshot(ctx, id); err != nil {
-		delete(c.history, id)
-		c.active = nil
+		delete(c.active, id)
 		req.reply <- startResult{err: err}
 		return
 	}
@@ -198,8 +204,8 @@ func (c *coordinator) handleStart(ctx context.Context, req *coordinatorStart) {
 }
 
 func (c *coordinator) handleGet(req *coordinatorGet) {
-	if c.active != nil && c.active.id == req.id {
-		req.reply <- getResult{result: c.active.view()}
+	if s, collecting := c.active[req.id]; collecting {
+		req.reply <- getResult{result: s.view()}
 		return
 	}
 	result, exists := c.history[req.id]
@@ -211,13 +217,12 @@ func (c *coordinator) handleGet(req *coordinatorGet) {
 }
 
 func (c *coordinator) handleReport(report snapshotReport) {
-	if c.active == nil || c.active.id != report.snapshotID {
-		// Reports from a finished or unknown snapshot cannot contaminate a
-		// later collection.
+	s, collecting := c.active[report.snapshotID]
+	if !collecting {
+		// Reports from a finished, cancelled, or unknown snapshot cannot
+		// contaminate another collection or rewrite a terminal state.
 		return
 	}
-
-	s := c.active
 	switch report.kind {
 	case reportLocal:
 		if s.localDone[report.nodeID] {
@@ -249,9 +254,8 @@ func (c *coordinator) handleReport(report snapshotReport) {
 	}
 
 	if len(s.localDone) == nodeCount && len(s.channelDone) == nodeCount*(nodeCount-1) {
-		result := s.view()
-		c.history[s.id] = result
-		c.active = nil
+		c.history[s.id] = s.view()
+		delete(c.active, s.id)
 	}
 }
 
@@ -332,18 +336,23 @@ func (c *coordinator) cancel(ctx context.Context, id int64) (*snapshotResult, er
 	}
 }
 func (c *coordinator) handleCancel(ctx context.Context, req *coordinatorCancel) {
-	if c.active != nil && c.active.id == req.id {
-		result := c.active.view()
+	if s, collecting := c.active[req.id]; collecting {
+		// Freeze the last accepted partial evidence as this ID's terminal
+		// state, release the collection slot, and retire the ID on every
+		// node so late markers cannot regenerate it.
+		result := s.view()
 		result.Cancelled = true
 		result.Complete = false
 		result.ConservationOK = false
 		c.history[req.id] = result
-		c.active = nil
+		delete(c.active, req.id)
 		for _, node := range c.nodes {
 			node.retire(ctx, req.id)
 		}
 		req.reply <- getResult{result: result}
 		return
 	}
+	// Completed and already cancelled IDs keep their stored terminal state;
+	// a repeated cancel returns it unchanged.
 	c.handleGet(&coordinatorGet{id: req.id, reply: req.reply})
 }

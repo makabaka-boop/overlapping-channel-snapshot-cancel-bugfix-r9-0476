@@ -233,7 +233,10 @@ func (n *node) beginSnapshot(ctx context.Context, id int64) error {
 func (n *node) handleCommand(cmd nodeCommand) {
 	switch {
 	case cmd.retire != nil:
+		// Retiring is terminal for this ID on this node: drop any session
+		// state and refuse to ever begin it again from a late marker.
 		delete(n.active, cmd.retire.id)
+		n.retired[cmd.retire.id] = true
 		cmd.retire.reply <- nil
 	case cmd.transferCmd != nil:
 		n.handleTransferCommand(cmd.transferCmd)
@@ -257,6 +260,11 @@ func (n *node) handleTransferCommand(req *transferCmd) {
 }
 
 func (n *node) handleBegin(req *beginSnapshot) {
+	if n.retired[req.id] {
+		// A retired (cancelled) ID must never start collecting again.
+		req.reply <- nil
+		return
+	}
 	if _, exists := n.active[req.id]; exists {
 		req.reply <- nil
 		return
@@ -311,6 +319,12 @@ func (n *node) handleTransferIngress(t *transfer) {
 }
 
 func (n *node) handleMarkerIngress(m *marker) {
+	if n.retired[m.SnapshotID] {
+		// Late or duplicate markers for a completed or cancelled snapshot
+		// must not regenerate its state on this node.
+		return
+	}
+
 	session, exists := n.active[m.SnapshotID]
 	if !exists {
 		// The first marker causes the local cut; handleBegin emits this node's
@@ -321,8 +335,9 @@ func (n *node) handleMarkerIngress(m *marker) {
 	}
 
 	state, ok := session.channels[m.From]
-	if !ok {
-		// A duplicate/stale marker must not replace an already reported cut.
+	if !ok || state.closed {
+		// A duplicate/stale marker must not replace or re-report an already
+		// recorded channel cut.
 		return
 	}
 	n.report(snapshotReport{
@@ -337,6 +352,7 @@ func (n *node) handleMarkerIngress(m *marker) {
 	session.remaining--
 	if session.remaining == 0 {
 		delete(n.active, m.SnapshotID)
+		n.retired[m.SnapshotID] = true
 	}
 }
 
